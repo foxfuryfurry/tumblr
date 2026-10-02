@@ -11,11 +11,12 @@ import io
 import os
 import re
 import json
+import shutil
 import html as html_lib
 from datetime import datetime, timezone
 from queue import Queue
 from threading import Thread, Lock, Event
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 import xmltodict
@@ -93,6 +94,38 @@ def folder_name(ts, post_id):
 
 def _host(site):
     return site if "." in site else site + ".tumblr.com"
+
+
+def parse_post_url(raw_url):
+    """Return the blog identifier and post ID from a Tumblr post URL."""
+    value = raw_url.strip()
+    if "://" not in value:
+        value = "https://" + value
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+
+    if host in ("tumblr.com", "www.tumblr.com"):
+        if parts[:2] == ["blog", "view"] and len(parts) >= 4:
+            site, post_id = parts[2], parts[3]
+        elif len(parts) >= 2:
+            site, post_id = parts[0], parts[1]
+        else:
+            site, post_id = "", ""
+    elif host.endswith(".tumblr.com"):
+        site = host[:-len(".tumblr.com")]
+        post_id = parts[1] if len(parts) >= 2 and parts[0] == "post" else ""
+    elif len(parts) >= 2 and parts[0] == "post":
+        site, post_id = host, parts[1]
+    else:
+        site, post_id = "", ""
+
+    if (not site or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", site)
+            or ".." in site):
+        raise ValueError("The URL does not contain a supported Tumblr blog name.")
+    if not re.fullmatch(r"\d+", post_id):
+        raise ValueError("The URL does not contain a numeric Tumblr post ID.")
+    return site, post_id
 
 
 def _dedupe(items):
@@ -398,6 +431,50 @@ class Crawler(object):
                 w.join()
         self.log("Stopped." if self.stop_event.is_set() else "All done.")
 
+    def download_single_post(self, raw_url):
+        try:
+            site, post_id = parse_post_url(raw_url)
+        except (AttributeError, ValueError) as e:
+            self.log("Invalid Tumblr post URL: %s" % e)
+            return
+
+        self.stats[site] = SiteStats()
+        self.newest[site] = None
+        self.status(site, "downloading post...")
+        workers = [Thread(target=self._worker, daemon=True) for _ in range(THREADS)]
+        for worker in workers:
+            worker.start()
+        try:
+            post = self._single_post_old(site, post_id)
+            queued = bool(post and self._queue_post(
+                site, os.path.join(self.out_dir, site), post.get("@id"),
+                post.get("@unix-timestamp"), build_metadata(post, site),
+                extract_media_old(post), replace=True))
+
+            if not queued and (self.oauth or self.consumer_key):
+                post = self._single_post_v2(site, post_id)
+                if post:
+                    post_key = post.get("id_string") or str(post.get("id", post_id))
+                    queued = self._queue_post(
+                        site, os.path.join(self.out_dir, site), post_key,
+                        post.get("timestamp"), build_metadata_v2(post, site),
+                        extract_media_v2(post), replace=True)
+
+            if not queued:
+                self.log("[%s] post %s was not found or contains no downloadable media." %
+                         (site, post_id))
+            self.queue.join()
+        finally:
+            for _ in workers:
+                self.queue.put(None)
+            for worker in workers:
+                worker.join()
+
+        outcome = "stopped" if self.stop_event.is_set() else "finished"
+        self.status(site, "%s \u00b7 %s" % (outcome, self.stats[site].summary()))
+        self.log("[%s] single post %s: %s" %
+                 (site, outcome, self.stats[site].summary()))
+
     # --- per blog ------------------------------------------------------------
 
     def _do_site(self, site, skip_reblogs, only_new=False):
@@ -454,9 +531,9 @@ class Crawler(object):
                 new_state["newest_post_ts"] = max(candidates)
         self.save_state(site, new_state)
 
-    def _queue_post(self, site, folder, post_id, ts, meta, media):
+    def _queue_post(self, site, folder, post_id, ts, meta, media, replace=False):
         if not media:
-            return    # text-only post: nothing to archive
+            return False    # text-only post: nothing to archive
         self.stats[site].add("queued")
         t = _ts(ts)
         if t is not None and (self.newest.get(site) is None or t > self.newest[site]):
@@ -466,9 +543,64 @@ class Crawler(object):
             "dir": os.path.join(folder, folder_name(ts, post_id)),
             "meta": meta,
             "media": media,
+            "replace": replace,
         })
+        return True
 
     # --- old /api/read endpoint ---------------------------------------------
+
+    def _single_post_old(self, site, post_id):
+        url = "https://{0}/api/read".format(_host(site))
+        try:
+            response = requests.get(url, params={"id": post_id, "num": 1},
+                                    proxies=self.proxies, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            self.log("[%s] post request failed: %r" % (site, e))
+            return None
+        if response.status_code != 200:
+            self.log("[%s] post endpoint returned HTTP %s" % (site, response.status_code))
+            return None
+
+        text = response.content.decode("utf-8", errors="replace")
+        cleaned = re.sub(
+            u"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]+",
+            u"", text)
+        try:
+            data = xmltodict.parse(cleaned)
+        except Exception as e:
+            self.log("[%s] could not parse post response: %r" % (site, e))
+            return None
+        posts_node = (data.get("tumblr") or {}).get("posts") or {}
+        for post in _as_list(posts_node.get("post")):
+            if str(post.get("@id", "")) == post_id:
+                return post
+        return None
+
+    def _single_post_v2(self, site, post_id):
+        api = "https://api.tumblr.com/v2/blog/%s/posts" % quote(_host(site), safe=".")
+        params = {"npf": "true", "id": post_id}
+        if not self.oauth:
+            params["api_key"] = self.consumer_key
+        try:
+            response = requests.get(api, params=params, auth=self.oauth,
+                                    proxies=self.proxies, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            self.log("[%s] v2 post request failed: %r" % (site, e))
+            return None
+        if response.status_code != 200:
+            self.log("[%s] v2 post API returned %s: %s" %
+                     (site, response.status_code, response.text[:300]))
+            return None
+        try:
+            posts = response.json().get("response", {}).get("posts", [])
+        except (ValueError, AttributeError) as e:
+            self.log("[%s] could not parse v2 post response: %r" % (site, e))
+            return None
+        for post in posts:
+            returned_id = post.get("id_string") or str(post.get("id", ""))
+            if returned_id == post_id:
+                return post
+        return None
 
     def _crawl_old(self, site, folder, skip_reblogs, since=None):
         base_url = "https://{0}/api/read?num={1}&start={2}"
@@ -589,7 +721,12 @@ class Crawler(object):
         post_dir = job["dir"]
         label = os.path.basename(post_dir)
         json_path = os.path.join(post_dir, "post.json")
-        if os.path.isfile(json_path):
+        if job.get("replace"):
+            if os.path.islink(post_dir) or os.path.isfile(post_dir):
+                os.remove(post_dir)
+            elif os.path.isdir(post_dir):
+                shutil.rmtree(post_dir)
+        elif os.path.isfile(json_path):
             return "skipped"          # finished on a previous run
 
         os.makedirs(post_dir, exist_ok=True)

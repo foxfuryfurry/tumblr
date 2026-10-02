@@ -208,6 +208,9 @@ class App(object):
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
+        self.single_btn = ttk.Button(buttons, text="Download singular posts",
+                         command=self.open_single_post_dialog)
+        self.single_btn.pack(side="left", padx=(8, 0))
 
         # Log
         log_box = ttk.LabelFrame(main, text="Log", padding=6)
@@ -270,6 +273,77 @@ class App(object):
     def start_row(self, row):
         """Start button on a single blog row: crawl only that blog."""
         self.start(only_row=row)
+
+    def open_single_post_dialog(self):
+        if self.running:
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Download singular posts")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        content = ttk.Frame(dialog, padding=12)
+        content.pack(fill="both", expand=True)
+        content.columnconfigure(0, weight=1)
+        ttk.Label(content, text="Tumblr post URL:").grid(row=0, column=0, sticky="w")
+        url_var = tk.StringVar()
+        entry = ttk.Entry(content, textvariable=url_var, width=72)
+        entry.grid(row=1, column=0, sticky="ew", pady=(4, 10))
+
+        buttons = ttk.Frame(content)
+        buttons.grid(row=2, column=0, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+
+        def submit():
+            post_url = url_var.get().strip()
+            if not post_url:
+                messagebox.showerror("Tumblr Archiver", "Enter a Tumblr post URL.", parent=dialog)
+                entry.focus_set()
+                return
+            dialog.destroy()
+            self.start_single_post(post_url)
+
+        ttk.Button(buttons, text="Download", command=submit).pack(side="right", padx=(0, 8))
+        dialog.bind("<Return>", lambda _event: submit())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.grab_set()
+        entry.focus_set()
+
+    def start_single_post(self, post_url):
+        if self.running:
+            return
+        out_dir = self.out_var.get().strip() or os.path.join(APP_DIR, "downloads")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Tumblr Archiver", "Can't use that save folder:\n%s" % e)
+            return
+        try:
+            proxies = core.load_proxies(PROXIES_PATH)
+        except ValueError:
+            messagebox.showerror("Tumblr Archiver", "proxies.json is not valid JSON.")
+            return
+        if proxies:
+            self._append_log("Using proxies from proxies.json")
+
+        self.save_config()
+        creds = dict((key, value.get()) for key, value in self.cred_vars.items())
+        self.crawler = core.Crawler(
+            [], out_dir, creds=creds, proxies=proxies,
+            log=lambda msg: self.events.put(("log", msg)),
+            status=lambda site, text: self.events.put(("status", site, text)))
+        self._set_running(True)
+        self._append_log("Downloading single post: %s" % post_url)
+        threading.Thread(target=self._run_single_post,
+                         args=(self.crawler, post_url), daemon=True).start()
+
+    def _run_single_post(self, crawler, post_url):
+        try:
+            crawler.download_single_post(post_url)
+        except Exception as e:
+            self.events.put(("log", "Fatal error: %r" % (e,)))
+        finally:
+            self.events.put(("finished",))
 
     def start(self, only_row=None):
         if self.running:
@@ -357,6 +431,7 @@ class App(object):
             row.set_enabled(not running)
         self.start_btn.configure(state="disabled" if running else "normal")
         self.stop_btn.configure(state="normal" if running else "disabled")
+        self.single_btn.configure(state="disabled" if running else "normal")
 
     # --- events from worker threads ---------------------------------------------
 
