@@ -102,8 +102,8 @@ class App(object):
     def __init__(self, root):
         self.root = root
         root.title("Tumblr Archiver")
-        root.geometry("980x780")
-        root.minsize(860, 560)
+        root.geometry("1180x780")
+        root.minsize(980, 560)
 
         self.events = queue.Queue()     # worker threads -> GUI thread
         self.rows = []
@@ -138,9 +138,9 @@ class App(object):
     def _build(self, cfg):
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
+        main.columnconfigure(0, weight=3)
+        main.columnconfigure(1, weight=2)
         main.rowconfigure(2, weight=1)
-        main.rowconfigure(4, weight=2)
 
         # Save folder
         top = ttk.Frame(main)
@@ -211,7 +211,7 @@ class App(object):
 
         # Log
         log_box = ttk.LabelFrame(main, text="Log", padding=6)
-        log_box.grid(row=4, column=0, sticky="nsew")
+        log_box.grid(row=0, column=1, rowspan=4, sticky="nsew", padx=(8, 0))
         log_box.rowconfigure(0, weight=1)
         log_box.columnconfigure(0, weight=1)
         self.log_text = tk.Text(log_box, height=10, wrap="word", state="disabled")
