@@ -49,15 +49,6 @@ def clean_blog_name(raw):
     return host
 
 
-def load_proxies(path):
-    """Returns the proxies dict from proxies.json, or None. Raises ValueError if invalid."""
-    if not os.path.exists(path):
-        return None
-    with open(path, "r") as f:
-        data = json.load(f)
-    return data or None
-
-
 def _as_list(value):
     if value is None:
         return []
@@ -145,7 +136,7 @@ def file_extension(url, kind):
     return ".jpg" if kind == "photo" else ".mp4"
 
 
-# Per-blog record, owned by the caller (the GUI keeps it in its config file):
+# Per-blog date record, owned and persisted by the GUI:
 #   last_downloaded : UTC time the last (completed) run for this blog finished
 #   newest_post_ts  : timestamp of the newest post saved; "only new posts" starts here
 def _ts(value):
@@ -381,7 +372,7 @@ class Crawler(object):
     """
 
     def __init__(self, blogs, out_dir, creds=None, proxies=None, log=print, status=None,
-                 done=None, get_state=None, save_state=None):
+                 done=None, get_state=None, save_state=None, record_download=None):
         self.blogs = blogs
         self.out_dir = out_dir
         self.proxies = proxies
@@ -390,6 +381,7 @@ class Crawler(object):
         self.done = done or (lambda site: None)
         self.get_state = get_state or (lambda site: {})
         self.save_state = save_state or (lambda site, state: None)
+        self.record_download = record_download or (lambda site, post_id: None)
         self.newest = {}     # blog -> newest post timestamp queued this run
         self.stop_event = Event()
         self.queue = Queue()
@@ -534,12 +526,14 @@ class Crawler(object):
     def _queue_post(self, site, folder, post_id, ts, meta, media, replace=False):
         if not media:
             return False    # text-only post: nothing to archive
+        post_id = str(post_id)
         self.stats[site].add("queued")
         t = _ts(ts)
         if t is not None and (self.newest.get(site) is None or t > self.newest[site]):
             self.newest[site] = t
         self.queue.put({
             "site": site,
+            "post_id": post_id,
             "dir": os.path.join(folder, folder_name(ts, post_id)),
             "meta": meta,
             "media": media,
@@ -710,6 +704,8 @@ class Crawler(object):
             result = "failed"
             try:
                 result = "stopped" if self.stop_event.is_set() else self._process(job)
+                if result == "done":
+                    self.record_download(site, job["post_id"])
             except Exception as e:
                 self.log("[%s] error in %s: %r" % (site, os.path.basename(job["dir"]), e))
             finally:

@@ -17,9 +17,9 @@ import tumblr_core as core
 
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "tumblr_gui_config.json")
-PROXIES_PATH = os.path.join(APP_DIR, "proxies.json")
+POST_STATE_PATH = os.path.join(APP_DIR, "post_state.json")
 MAX_LOG_LINES = 2000
-STATE_KEYS = ("last_downloaded", "newest_post_ts")   # stored inside each blog entry
+STATE_KEYS = ("last_downloaded", "newest_post_ts")
 
 API_FIELDS = [
     ("consumer_key", "Consumer key"),
@@ -114,20 +114,45 @@ class App(object):
         cfg = load_config()
         self.migrated = False
         self._build(cfg)
+        self.post_state, self.post_state_writable = self._load_post_state()
+        self.post_id_sets = dict(
+            (name, set(record["downloaded_ids"]))
+            for name, record in self.post_state.items())
+        if not self.post_state_writable:
+            self._append_log("Could not read post_state.json; preserving legacy dates and not "
+                             "overwriting the post state.")
 
         out_dir = cfg.get("out_dir") or os.path.join(APP_DIR, "downloads")
         for blog in cfg.get("blogs") or []:
             if isinstance(blog, dict) and blog.get("name"):
-                state = dict((k, blog[k]) for k in STATE_KEYS if k in blog)
-                if not state:
-                    state = self._import_old_state(
-                        cfg.get("dates"), out_dir, core.clean_blog_name(blog["name"]))
+                name = core.clean_blog_name(blog["name"])
+                state = self.post_state.get(name, {})
+                legacy_state = dict((k, blog[k]) for k in STATE_KEYS if k in blog)
+                if (self.post_state_writable
+                        and not any(key in state for key in STATE_KEYS)
+                        and not legacy_state):
+                    legacy_state.update(self._import_old_state(
+                        cfg.get("dates"), out_dir, name))
+                if legacy_state and self.post_state_writable:
+                    self.migrated = True
+                if self.post_state_writable:
+                    state = self.post_state.setdefault(name, {"downloaded_ids": []})
+                    self.post_id_sets.setdefault(name, set())
+                    for key, value in legacy_state.items():
+                        if key not in state:
+                            state[key] = value
+                else:
+                    state = legacy_state
+                row_state = dict((k, state[k]) for k in STATE_KEYS if k in state)
                 self.add_row(blog["name"], bool(blog.get("skip_reblogs", True)),
-                             bool(blog.get("only_new", True)), state=state)
+                             bool(blog.get("only_new", True)), state=row_state)
         if not self.rows:
             self.add_row()
+        if self.post_state_writable:
+            self._scan_existing_post_ids(out_dir)
+            self._save_post_state()
         self.refresh_info()
-        if self.migrated:
+        if self.migrated and self.post_state_writable:
             self.save_config()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -318,20 +343,14 @@ class App(object):
         except OSError as e:
             messagebox.showerror("Tumblr Archiver", "Can't use that save folder:\n%s" % e)
             return
-        try:
-            proxies = core.load_proxies(PROXIES_PATH)
-        except ValueError:
-            messagebox.showerror("Tumblr Archiver", "proxies.json is not valid JSON.")
-            return
-        if proxies:
-            self._append_log("Using proxies from proxies.json")
-
         self.save_config()
         creds = dict((key, value.get()) for key, value in self.cred_vars.items())
         self.crawler = core.Crawler(
-            [], out_dir, creds=creds, proxies=proxies,
+            [], out_dir, creds=creds,
             log=lambda msg: self.events.put(("log", msg)),
-            status=lambda site, text: self.events.put(("status", site, text)))
+            status=lambda site, text: self.events.put(("status", site, text)),
+            record_download=lambda site, post_id: self.events.put(
+                ("downloaded", site, post_id)))
         self._set_running(True)
         self._append_log("Downloading single post: %s" % post_url)
         threading.Thread(target=self._run_single_post,
@@ -383,24 +402,18 @@ class App(object):
             messagebox.showerror("Tumblr Archiver", "Can't use that save folder:\n%s" % e)
             return
 
-        try:
-            proxies = core.load_proxies(PROXIES_PATH)
-        except ValueError:
-            messagebox.showerror("Tumblr Archiver", "proxies.json is not valid JSON.")
-            return
-        if proxies:
-            self._append_log("Using proxies from proxies.json")
-
         self.save_config()
         states = dict((r.key, r.state) for r in self.rows if r.key)
         creds = dict((k, v.get()) for k, v in self.cred_vars.items())
         self.crawler = core.Crawler(
-            blogs, out_dir, creds=creds, proxies=proxies,
+            blogs, out_dir, creds=creds,
             log=lambda msg: self.events.put(("log", msg)),
             status=lambda site, text: self.events.put(("status", site, text)),
             done=lambda site: self.events.put(("done", site)),
             get_state=lambda site: states.get(site, {}),
-            save_state=lambda site, state: self.events.put(("state", site, state)))
+            save_state=lambda site, state: self.events.put(("state", site, state)),
+            record_download=lambda site, post_id: self.events.put(
+                ("downloaded", site, post_id)))
 
         self._set_running(True)
         self._append_log("Starting: %s" % ", ".join(
@@ -449,10 +462,15 @@ class App(object):
                     for row in self.rows:
                         if row.key == event[1]:
                             row.state, row.state_name = dict(event[2]), event[1]
-                    self.save_config()
+                    self._update_post_state(event[1], event[2])
+                    if not self.post_state_writable:
+                        self.save_config()
+                elif event[0] == "downloaded":
+                    self._record_downloaded_post(event[1], event[2])
                 elif event[0] == "done":
                     self.refresh_info()
                 elif event[0] == "finished":
+                    self._save_post_state()
                     self.crawler = None
                     self._set_running(False)
                     self.refresh_info()
@@ -472,12 +490,122 @@ class App(object):
     # --- config / closing ----------------------------------------------------------
 
     def refresh_info(self):
-        """Show each blog's stored dates (they live in that blog's entry in the config)."""
+        """Show each blog's stored dates."""
         for row in self.rows:
             if core.clean_blog_name(row.name_var.get()):
                 row.info_var.set(core.describe_state(row.state_for_name()))
             else:
                 row.info_var.set("")
+
+    def _load_post_state(self):
+        try:
+            with open(POST_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}, True
+        except (OSError, ValueError):
+            return {}, False
+
+        if not isinstance(data, dict) or not isinstance(data.get("blogs"), dict):
+            return {}, False
+
+        state = {}
+        for name, record in data["blogs"].items():
+            if not isinstance(name, str) or not isinstance(record, dict):
+                return {}, False
+            ids = record.get("downloaded_ids", [])
+            if (not isinstance(ids, list)
+                    or any(not isinstance(post_id, (str, int)) or isinstance(post_id, bool)
+                           for post_id in ids)):
+                return {}, False
+            state[name] = {
+                "downloaded_ids": sorted(set(str(post_id) for post_id in ids)),
+            }
+            for key in STATE_KEYS:
+                if key in record:
+                    state[name][key] = record[key]
+        return state, True
+
+    def _scan_existing_post_ids(self, out_dir):
+        """Import completed archive IDs once into the root-level registry."""
+        try:
+            blog_dirs = os.scandir(out_dir)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            self._append_log("Could not scan downloaded posts in %s: %s" % (out_dir, e))
+            return
+
+        with blog_dirs:
+            for blog_entry in blog_dirs:
+                try:
+                    if not blog_entry.is_dir(follow_symlinks=False):
+                        continue
+                    post_dirs = os.scandir(blog_entry.path)
+                except OSError as e:
+                    self._append_log("Could not scan %s: %s" % (blog_entry.path, e))
+                    continue
+
+                ids = set()
+                with post_dirs:
+                    for post_entry in post_dirs:
+                        try:
+                            if not post_entry.is_dir(follow_symlinks=False):
+                                continue
+                            post_id = post_entry.name.rsplit("_", 1)[-1]
+                            if (post_id.isdigit()
+                                    and os.path.isfile(os.path.join(
+                                        post_entry.path, "post.json"))):
+                                ids.add(post_id)
+                        except OSError as e:
+                            self._append_log("Could not inspect %s: %s" %
+                                             (post_entry.path, e))
+                if ids:
+                    self.post_state.setdefault(
+                        blog_entry.name, {"downloaded_ids": []})
+                    self.post_id_sets.setdefault(blog_entry.name, set()).update(ids)
+
+    def _save_post_state(self):
+        if not self.post_state_writable:
+            return False
+        temp_path = POST_STATE_PATH + ".part"
+        try:
+            blogs = {}
+            for name, record in self.post_state.items():
+                stored = dict(record)
+                stored["downloaded_ids"] = sorted(
+                    self.post_id_sets.get(name, set()))
+                blogs[name] = stored
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump({"blogs": blogs}, f, indent=4, ensure_ascii=False)
+            os.replace(temp_path, POST_STATE_PATH)
+            return True
+        except OSError as e:
+            self._append_log("Could not save post_state.json: %s" % e)
+            self.post_state_writable = False
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            return False
+
+    def _update_post_state(self, name, state):
+        if not self.post_state_writable:
+            return
+        record = self.post_state.setdefault(name, {"downloaded_ids": []})
+        for key in STATE_KEYS:
+            if key in state:
+                record[key] = state[key]
+        self._save_post_state()
+
+    def _record_downloaded_post(self, name, post_id):
+        if not self.post_state_writable:
+            self._append_log("Could not record downloaded post %s for %s: "
+                             "post_state.json is unavailable." % (post_id, name))
+            return
+        self.post_state.setdefault(name, {"downloaded_ids": []})
+        self.post_id_sets.setdefault(name, set()).add(str(post_id))
 
     def _import_old_state(self, old_dates, out_dir, name):
         """Dates from earlier versions: the old 'dates' section of this config, or a
@@ -518,9 +646,10 @@ class App(object):
                      "skip_reblogs": bool(r.skip_var.get()),
                      "only_new": bool(r.only_new_var.get())}
             state = r.state_for_name()
-            for k in STATE_KEYS:
-                if k in state:
-                    entry[k] = state[k]
+            if not self.post_state_writable:
+                for k in STATE_KEYS:
+                    if k in state:
+                        entry[k] = state[k]
             data["blogs"].append(entry)
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
